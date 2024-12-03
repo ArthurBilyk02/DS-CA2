@@ -7,8 +7,28 @@ import {
   S3Client,
   PutObjectCommand,
 } from "@aws-sdk/client-s3";
+import { DynamoDBClient, PutItemCommand } from "@aws-sdk/client-dynamodb";
 
 const s3 = new S3Client();
+const dynamodb = new DynamoDBClient({ region: "eu-west-1" });
+
+const tableName = process.env.TABLE_NAME;
+
+// Function to log valid uploads to DynamoDB
+async function logValidUpload(fileName: string) {
+  if (!tableName) {
+    throw new Error("TABLE_NAME environment variable is not defined");
+  }
+
+  const params = {
+    TableName: tableName,
+    Item: {
+      fileName: { S: fileName },
+    },
+  };
+
+  await dynamodb.send(new PutItemCommand(params));
+}
 
 export const handler: SQSHandler = async (event) => {
   console.log("Event ", JSON.stringify(event));
@@ -23,18 +43,17 @@ export const handler: SQSHandler = async (event) => {
         const srcBucket = s3e.bucket.name;
         // Object key may have spaces or unicode non-ASCII characters.
         const srcKey = decodeURIComponent(s3e.object.key.replace(/\+/g, " "));
-        let origimage = null;
-        try {
-          // Download the image from the S3 source bucket.
-          const params: GetObjectCommandInput = {
-            Bucket: srcBucket,
-            Key: srcKey,
-          };
-          origimage = await s3.send(new GetObjectCommand(params));
-          // Process the image ......
-        } catch (error) {
-          console.log(error);
+
+        // Validate file type
+        const match = srcKey.toLowerCase().match(/\.(jpeg|png)$/);
+        if (!match) {
+          console.error(`Unsupported file type: ${srcKey}`);
+          throw new Error(`Unsupported file type: ${srcKey}`);
         }
+
+        console.log(`Processing valid file: ${srcKey}`);
+
+        await logValidUpload(srcKey);
       }
     }
   }

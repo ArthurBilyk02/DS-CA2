@@ -9,10 +9,17 @@ import * as sns from "aws-cdk-lib/aws-sns";
 import * as subs from "aws-cdk-lib/aws-sns-subscriptions";
 import * as iam from "aws-cdk-lib/aws-iam";
 import { Construct } from "constructs";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 
 export class EDAAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
+
+    // DynamoDB Table
+    const imageTable = new dynamodb.Table(this, "ImageTable", {
+      partitionKey: { name: "fileName", type: dynamodb.AttributeType.STRING },
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
 
     // S3 Bucket
     const imagesBucket = new s3.Bucket(this, "images", {
@@ -45,6 +52,9 @@ export class EDAAppStack extends cdk.Stack {
       entry: `${__dirname}/../lambdas/processImage.ts`,
       timeout: cdk.Duration.seconds(15),
       memorySize: 128,
+      environment: {
+        TABLE_NAME: imageTable.tableName,
+      },
     });
 
     const mailerFn = new lambdanode.NodejsFunction(this, "MailerFunction", {
@@ -90,6 +100,7 @@ export class EDAAppStack extends cdk.Stack {
     imagesBucket.grantRead(processImageFn);
     imageProcessQueue.grantConsumeMessages(processImageFn); // Allows ProcessImageFn to consume messages from imageProcessQueue
     mailerQueue.grantConsumeMessages(mailerFn);             // Allows MailerFunction to consume messages from mailerQueue
+    imageTable.grantWriteData(processImageFn);              // Allows ProcessImageFn to write data to ImageTable
 
     // Output the S3 bucket name
     new cdk.CfnOutput(this, "bucketName", {
