@@ -74,6 +74,26 @@ export class EDAAppStack extends cdk.Stack {
       entry: `${__dirname}/../lambdas/mailer.ts`,
     });
 
+    const updateMetadataFn = new lambdanode.NodejsFunction(this, "UpdateMetadataFn", {
+      runtime: lambda.Runtime.NODEJS_18_X,
+      entry: `${__dirname}/../lambdas/updateMetadata.ts`,
+      memorySize: 256,
+      timeout: cdk.Duration.seconds(10),
+      environment: {
+        TABLE_NAME: imageTable.tableName,
+      },
+    });
+
+    newImageTopic.addSubscription(
+      new subs.LambdaSubscription(updateMetadataFn, {
+        filterPolicy: {
+          metadata_type: sns.SubscriptionFilter.stringFilter({
+            allowlist: ["Caption", "Date", "Photographer"],
+          }),
+        },
+      })
+    );
+
     // Grant SES Permissions to Mailer Lambda
     mailerFn.addToRolePolicy(
       new iam.PolicyStatement({
@@ -144,6 +164,7 @@ export class EDAAppStack extends cdk.Stack {
     imageProcessQueue.grantConsumeMessages(processImageFn); // Allows ProcessImageFn to consume messages from imageProcessQueue
     mailerQueue.grantConsumeMessages(mailerFn);             // Allows MailerFunction to consume messages from mailerQueue
     imageTable.grantWriteData(processImageFn);              // Allows ProcessImageFn to write data to ImageTable
+    imageTable.grantWriteData(updateMetadataFn);            // Allows UpdateMetadataFn to write data to ImageTable
 
     // Output the S3 bucket name
     new cdk.CfnOutput(this, "bucketName", {
