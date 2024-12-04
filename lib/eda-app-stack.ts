@@ -29,12 +29,22 @@ export class EDAAppStack extends cdk.Stack {
     });
 
     // SQS Queues
+    // Create Dead Letter Queue
+    const dlq = new sqs.Queue(this, "DeadLetterQueue", {
+      retentionPeriod: cdk.Duration.days(4),
+    });
+
+    // Attach DLQ to the main queue
     const imageProcessQueue = new sqs.Queue(this, "img-created-queue", {
-      receiveMessageWaitTime: cdk.Duration.seconds(10),
+      visibilityTimeout: cdk.Duration.seconds(20),
+      deadLetterQueue: {
+        queue: dlq,
+        maxReceiveCount: 1,
+      },
     });
 
     const mailerQueue = new sqs.Queue(this, "mailer-queue", {
-      receiveMessageWaitTime: cdk.Duration.seconds(10),
+      receiveMessageWaitTime: cdk.Duration.seconds(20),
     });
 
     // SNS Topic
@@ -88,13 +98,46 @@ export class EDAAppStack extends cdk.Stack {
       batchSize: 5,
       maxBatchingWindow: cdk.Duration.seconds(5),
     });
-    processImageFn.addEventSource(newImageEventSource);
+    processImageFn.addEventSource(
+      new events.SqsEventSource(imageProcessQueue, {
+        batchSize: 1,
+        maxBatchingWindow: cdk.Duration.seconds(5),
+        reportBatchItemFailures: true,
+      })
+    );
 
     const newImageMailEventSource = new events.SqsEventSource(mailerQueue, {
       batchSize: 5,
       maxBatchingWindow: cdk.Duration.seconds(5),
     });
     mailerFn.addEventSource(newImageMailEventSource);
+
+    const rejectionMailerFn = new lambdanode.NodejsFunction(this, "RejectionMailerFn", {
+      runtime: lambda.Runtime.NODEJS_18_X,
+      entry: `${__dirname}/../lambdas/rejectionMailer.ts`,
+      memorySize: 256,
+      timeout: cdk.Duration.seconds(10),
+      environment: {
+        SES_EMAIL_FROM: "arthurbilyk82@gmail.com",
+        SES_EMAIL_TO: "arthurbilyk82@gmail.com",
+        SES_REGION: "eu-west-1",
+      },
+    });
+    
+    rejectionMailerFn.addEventSource(
+      new events.SqsEventSource(dlq, {
+        batchSize: 5,
+        maxBatchingWindow: cdk.Duration.seconds(5),
+      })
+    );
+    
+    rejectionMailerFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ["ses:SendEmail", "ses:SendRawEmail", "ses:SendTemplatedEmail"],
+        resources: ["*"],
+      })
+    );
 
     // Grant necessary permissions
     imagesBucket.grantRead(processImageFn);
