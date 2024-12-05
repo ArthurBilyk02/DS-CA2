@@ -10,6 +10,9 @@ import * as subs from "aws-cdk-lib/aws-sns-subscriptions";
 import * as iam from "aws-cdk-lib/aws-iam";
 import { Construct } from "constructs";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
+import { StreamViewType } from "aws-cdk-lib/aws-dynamodb";
+import { DynamoEventSource } from "aws-cdk-lib/aws-lambda-event-sources";
+import { StartingPosition } from "aws-cdk-lib/aws-lambda";
 
 export class EDAAppStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -19,6 +22,7 @@ export class EDAAppStack extends cdk.Stack {
     const imageTable = new dynamodb.Table(this, "ImageTable", {
       partitionKey: { name: "fileName", type: dynamodb.AttributeType.STRING },
       removalPolicy: cdk.RemovalPolicy.DESTROY,
+      stream: StreamViewType.NEW_AND_OLD_IMAGES, // Enable streams for handling deletes
     });
 
     // S3 Bucket
@@ -29,12 +33,10 @@ export class EDAAppStack extends cdk.Stack {
     });
 
     // SQS Queues
-    // Create Dead Letter Queue
     const dlq = new sqs.Queue(this, "DeadLetterQueue", {
       retentionPeriod: cdk.Duration.days(4),
     });
 
-    // Attach DLQ to the main queue
     const imageProcessQueue = new sqs.Queue(this, "img-created-queue", {
       visibilityTimeout: cdk.Duration.seconds(20),
       deadLetterQueue: {
@@ -52,7 +54,6 @@ export class EDAAppStack extends cdk.Stack {
       displayName: "New Image topic",
     });
 
-    // Add SQS Subscriptions to SNS Topic
     newImageTopic.addSubscription(new subs.SqsSubscription(imageProcessQueue));
     newImageTopic.addSubscription(new subs.SqsSubscription(mailerQueue));
 
@@ -64,6 +65,7 @@ export class EDAAppStack extends cdk.Stack {
       memorySize: 128,
       environment: {
         TABLE_NAME: imageTable.tableName,
+        BUCKET_NAME: imagesBucket.bucketName,
       },
     });
 
@@ -72,7 +74,13 @@ export class EDAAppStack extends cdk.Stack {
       memorySize: 1024,
       timeout: cdk.Duration.seconds(3),
       entry: `${__dirname}/../lambdas/mailer.ts`,
+      environment: {
+        SES_EMAIL_FROM: "arthurbilyk82@gmail.com",
+        SES_EMAIL_TO: "arthurbilyk82@gmail.com",
+        SES_REGION: "eu-west-1",
+      },
     });
+    
 
     const updateMetadataFn = new lambdanode.NodejsFunction(this, "UpdateMetadataFn", {
       runtime: lambda.Runtime.NODEJS_18_X,
@@ -113,11 +121,12 @@ export class EDAAppStack extends cdk.Stack {
       new s3n.SnsDestination(newImageTopic)
     );
 
+    imagesBucket.addEventNotification(
+      s3.EventType.OBJECT_REMOVED,
+      new s3n.SnsDestination(newImageTopic)
+    );
+
     // Add SQS Event Sources to Lambdas
-    const newImageEventSource = new events.SqsEventSource(imageProcessQueue, {
-      batchSize: 5,
-      maxBatchingWindow: cdk.Duration.seconds(5),
-    });
     processImageFn.addEventSource(
       new events.SqsEventSource(imageProcessQueue, {
         batchSize: 1,
@@ -126,11 +135,12 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
-    const newImageMailEventSource = new events.SqsEventSource(mailerQueue, {
-      batchSize: 5,
-      maxBatchingWindow: cdk.Duration.seconds(5),
-    });
-    mailerFn.addEventSource(newImageMailEventSource);
+    mailerFn.addEventSource(
+      new events.SqsEventSource(mailerQueue, {
+        batchSize: 5,
+        maxBatchingWindow: cdk.Duration.seconds(5),
+      })
+    );
 
     const rejectionMailerFn = new lambdanode.NodejsFunction(this, "RejectionMailerFn", {
       runtime: lambda.Runtime.NODEJS_18_X,
@@ -143,14 +153,14 @@ export class EDAAppStack extends cdk.Stack {
         SES_REGION: "eu-west-1",
       },
     });
-    
+
     rejectionMailerFn.addEventSource(
       new events.SqsEventSource(dlq, {
         batchSize: 5,
         maxBatchingWindow: cdk.Duration.seconds(5),
       })
     );
-    
+
     rejectionMailerFn.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -159,12 +169,22 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
+    // Add DynamoDB Event Source to Process Image Function for DELETE events
+    processImageFn.addEventSource(
+      new DynamoEventSource(imageTable, {
+        startingPosition: StartingPosition.LATEST,
+        batchSize: 5,
+        bisectBatchOnError: true,
+        retryAttempts: 2,
+      })
+    );
+
     // Grant necessary permissions
-    imagesBucket.grantRead(processImageFn);
-    imageProcessQueue.grantConsumeMessages(processImageFn); // Allows ProcessImageFn to consume messages from imageProcessQueue
-    mailerQueue.grantConsumeMessages(mailerFn);             // Allows MailerFunction to consume messages from mailerQueue
-    imageTable.grantWriteData(processImageFn);              // Allows ProcessImageFn to write data to ImageTable
-    imageTable.grantWriteData(updateMetadataFn);            // Allows UpdateMetadataFn to write data to ImageTable
+    imagesBucket.grantReadWrite(processImageFn);
+    imageProcessQueue.grantConsumeMessages(processImageFn);
+    mailerQueue.grantConsumeMessages(mailerFn);
+    imageTable.grantWriteData(processImageFn);
+    imageTable.grantWriteData(updateMetadataFn);
 
     // Output the S3 bucket name
     new cdk.CfnOutput(this, "bucketName", {
